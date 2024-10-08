@@ -1,79 +1,63 @@
 import sys
 import socket
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 import re
 
-# Get urls_file name from command line
-if len(sys.argv) != 2:
-    print('Usage: monitor urls_file')
-    sys.exit()
-
-urls_file = sys.argv[1]
-
-
-# Function to create and return a TCP connection
-def create_tcp_connection(host, port):
+def create_connection(host, port):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         sock.connect((host, port))
         return sock
     except Exception as e:
-        print(f"Network Error:\n {e}")
         return None
 
-
-# Function to send HTTP request and receive response
-def send_http_request(sock, host, path):
-    request = f"GET {path} HTTP/1.0\r\n"
-    request += f"Host: {host}\r\n"
-    request += "\r\n"
-
-    try:
-        sock.send(bytes(request, 'utf-8'))
-        response = b""
-        while True:
-            data = sock.recv(4096)
-            if not data:
-                break
-            response += data
-        return response.decode('utf-8')
-    except Exception as e:
-        print(f"Error while receiving data: {e}")
-        return None
-
-
-# Function to extract the status code from the response
-def extract_status(response):
+def status_code(response):
     lines = response.split("\r\n")
-    status_line = lines[0]  # The first line contains the status
+    status_line = lines[0]
     parts = status_line.split(" ")
-    status_code = int(parts[1])
+    code = int(parts[1])
     status_text = " ".join(parts[2:])
-    return status_code, status_text
+    return code, status_text
 
-
-# Function to extract the "Location" header for redirection
-def get_redirect_location(response):
-    lines = response.split("\r\n")
-    for line in lines:
-        if line.lower().startswith("location:"):
-            return line.split(": ")[1]
+def get_image_url(response, base_url):
+    img_tags = re.findall(r'<img\s+[^>]*src="([^"]+)"', response, re.IGNORECASE)
+    for tag in img_tags:
+        if tag.startswith("/"):
+            return base_url+tag
+        else:
+            return tag
     return None
 
 
-# Function to extract image URLs from HTML content
-def extract_image_urls(html_content, base_url):
-    image_urls = []
-    img_tags = re.findall(r'<img\s+[^>]*src="([^"]+)"', html_content, re.IGNORECASE)
-    for img_url in img_tags:
-        # Handle relative URLs
-        full_img_url = urljoin(base_url, img_url)
-        image_urls.append(full_img_url)
-    return image_urls
+def get_redirect(response):
+    lines = response.split("\r\n")
+    for line in lines:
+        if line.startswith("Location:"):
+            parts = line.split(" ")
+            return parts[1]
+    return None
+
+def receive_full_response(sock):
+    response = b''
+    while True:
+        data = sock.recv(4096)
+        response += data
+        if not data:
+            break
+    return response.decode()
 
 
-# Function to process each URL and handle redirection if necessary
+def send_request(sock, host, path):
+    request = f"GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n"
+    try:
+        sock.sendall(request.encode())
+        response = receive_full_response(sock)
+        return response
+    except Exception as e:
+        return None
+
+
 def process_url(url):
     url = url.strip()
     parsed_url = urlparse(url)
@@ -82,61 +66,79 @@ def process_url(url):
     host = parsed_url.netloc
     path = parsed_url.path if parsed_url.path else '/'
 
-    if protocol == 'http':
-        port = 80
-    elif protocol == 'https':
-        port = 443
-        # For HTTPS, we need to wrap the socket with SSL
-        import ssl
-        context = ssl.create_default_context()
-    else:
-        print(f"Unknown protocol for URL: {url}")
+    port = 443 if protocol == 'https' else 80
+    sock = create_connection(host, port)
+
+    print(f"URL: {url}")
+    if sock is None:
+        print("Status: Network Error")
+        print()
         return
 
-    # Create TCP connection
-    sock = create_tcp_connection(host, port)
-    if sock:
-        if protocol == 'https':
-            # Wrap the socket with SSL for HTTPS
-            sock = context.wrap_socket(sock, server_hostname=host)
+    response = send_request(sock, host, path)
+    if response:
+        code, status = status_code(response)
+        print(f"Status: {code} {status}")
 
-        # Send HTTP request and receive response
-        response = send_http_request(sock, host, path)
-        sock.close()
-
-        if response:
-            # Extract the status code and text
-            status_code, status_text = extract_status(response)
-            print(f"URL: {url}")
-            print(f"Status: {status_code} {status_text}")
-
-            # Handle redirection if status code is 301 or 302
-            if status_code in [301, 302]:
-                redirect_url = get_redirect_location(response)
-                if redirect_url:
-                    print(f"Redirected URL: {redirect_url}")
-                    process_url(redirect_url)
-                else:
-                    print(f"Error: No 'Location' header for redirection")
-            else:
-                # Extract and process referenced images from the HTML content (for 2XX status codes)
-                if status_code in range(200, 300):
-                    base_url = f"{protocol}://{host}"
-                    image_urls = extract_image_urls(response, base_url)
-                    for img_url in image_urls:
-                        print(f"Referenced URL: {img_url}")
-                        process_url(img_url)  # Fetch the referenced image URL
+        new_url = None
+        if code in [301, 302]:
+            redirect_url = get_redirect(response)
+            print(f"Redirected URL: {redirect_url}")
+            new_url = redirect_url
 
         else:
-            print(f"Error: No response received for URL: {url}")
+            # see if there is anything referenced in the response
+            image_url = get_image_url(response, f'{protocol}://{host}')
+            if image_url:
+                print(f"Referenced URL: {image_url}")
+                new_url = image_url
+
+        if new_url:
+            parsed_new = urlparse(new_url)
+
+            protocol = parsed_new.scheme
+            host = parsed_new.netloc
+            path = parsed_new.path if parsed_new.path else '/'
+
+            port = 443 if protocol == 'https' else 80
+            sock = create_connection(host, port)
+            if sock is None:
+                print("Status: Network Error")
+                print()
+                return
+            response = send_request(sock, host, path)
+            if response:
+                code, status = status_code(response)
+                print(f"Status: {code} {status}")
+            else:
+                print("Status: Network Error")
+
     else:
-        print(f"Could not connect to {url}")
+        print("Status: Network Error")
+
+    sock.close()
+    # New Line
+    print()
+
+def main():
+    # get urls_file name from command line
+    if len(sys.argv) != 2:
+        print('Usage: monitor urls_file')
+        sys.exit()
+
+    # text file to get list of urls
+    urls_file = sys.argv[1]
+
+    try:
+        with open(urls_file) as f:
+            urls = f.readlines()
+    except Exception as e:
+        print(f'Error reading file: {e}')
+        sys.exit()
+
+    for url in urls:
+        process_url(url)
 
 
-# Read URLs from the file
-with open(urls_file, 'r') as file:
-    urls = file.readlines()
-
-# Process each URL
-for url in urls:
-    process_url(url)
+if __name__ == '__main__':
+    main()
